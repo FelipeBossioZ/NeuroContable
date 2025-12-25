@@ -22,7 +22,6 @@ import {
 } from 'react-icons/fi';
 import { format, subMonths, startOfMonth, endOfMonth, startOfYear, endOfYear } from 'date-fns';
 import { es } from 'date-fns/locale';
-import ExcelJS from 'exceljs';
 import { jsPDF } from 'jspdf';
 import 'jspdf-autotable';
 
@@ -133,6 +132,18 @@ const Reportes = () => {
     '#38b2ac', '#667eea', '#ed64a6', '#ecc94b', '#fc8181'
   ];
 
+  // Formatear fecha de forma segura
+  const formatearFechaSegura = (fechaStr, formatoStr) => {
+    if (!fechaStr) return '';
+    try {
+      const fecha = new Date(fechaStr + 'T00:00:00');
+      if (isNaN(fecha.getTime())) return fechaStr;
+      return format(fecha, formatoStr, { locale: es });
+    } catch {
+      return fechaStr;
+    }
+  };
+
   // Configurar datos de gráficas según el tipo de reporte
   const getChartData = () => {
     if (tipoReporte === 'periodo') {
@@ -141,8 +152,7 @@ const Reportes = () => {
           if (filtros.agrupacion === 'mensual') {
             return d.periodo;
           }
-          const fecha = new Date(d.periodo + 'T00:00:00');
-          return format(fecha, 'dd MMM', { locale: es });
+          return formatearFechaSegura(d.periodo, 'dd MMM');
         }),
         datasets: [
           {
@@ -229,89 +239,95 @@ const Reportes = () => {
     cantidad: acc.cantidad + (d.cantidad || 1)
   }), { ingresos: 0, egresos: 0, cantidad: 0 });
 
-  // Exportar reporte
+  // Exportar reporte a CSV
   const exportarExcel = async () => {
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Reporte');
+    try {
+      const periodoTexto = `${formatearFechaSegura(filtros.fechaInicio, 'dd/MM/yyyy')} - ${formatearFechaSegura(filtros.fechaFin, 'dd/MM/yyyy')}`;
+      let headers, rows;
 
-    // Título
-    worksheet.mergeCells('A1:E1');
-    worksheet.getCell('A1').value = `Reporte: ${getTituloReporte()}`;
-    worksheet.getCell('A1').font = { bold: true, size: 14 };
+      // Datos según tipo de reporte
+      if (tipoReporte === 'periodo') {
+        headers = ['Período', 'Ingresos', 'Egresos', 'Saldo'];
+        rows = datosReporte.map(d => [d.periodo, d.ingresos, d.egresos, d.saldo]);
+      } else if (tipoReporte === 'conceptoIngreso' || tipoReporte === 'conceptoEgreso') {
+        headers = ['Código', 'Concepto', 'Cantidad', 'Total'];
+        rows = datosReporte.map(d => [
+          d.codigo,
+          `"${(d.concepto || '').replace(/"/g, '""')}"`,
+          d.cantidad,
+          d.total
+        ]);
+      } else if (tipoReporte === 'tercero') {
+        headers = ['Código', 'Tercero', 'Ingresos', 'Egresos', 'Saldo'];
+        rows = datosReporte.map(d => [
+          d.codigo,
+          `"${(d.nombre || '').replace(/"/g, '""')}"`,
+          d.ingresos,
+          d.egresos,
+          d.saldo
+        ]);
+      }
 
-    worksheet.mergeCells('A2:E2');
-    worksheet.getCell('A2').value = `Período: ${format(new Date(filtros.fechaInicio), 'dd/MM/yyyy')} - ${format(new Date(filtros.fechaFin), 'dd/MM/yyyy')}`;
+      // Crear contenido CSV
+      const csvContent = [
+        `"${getTituloReporte()}"`,
+        `"Período: ${periodoTexto}"`,
+        '',
+        headers.join(','),
+        ...rows.map(r => r.join(','))
+      ].join('\n');
 
-    // Datos según tipo de reporte
-    if (tipoReporte === 'periodo') {
-      worksheet.addRow([]);
-      worksheet.addRow(['Período', 'Ingresos', 'Egresos', 'Saldo']);
-      datosReporte.forEach(d => {
-        worksheet.addRow([d.periodo, d.ingresos, d.egresos, d.saldo]);
-      });
-    } else if (tipoReporte === 'conceptoIngreso' || tipoReporte === 'conceptoEgreso') {
-      worksheet.addRow([]);
-      worksheet.addRow(['Código', 'Concepto', 'Cantidad', 'Total']);
-      datosReporte.forEach(d => {
-        worksheet.addRow([d.codigo, d.concepto, d.cantidad, d.total]);
-      });
-    } else if (tipoReporte === 'tercero') {
-      worksheet.addRow([]);
-      worksheet.addRow(['Código', 'Tercero', 'Ingresos', 'Egresos', 'Saldo']);
-      datosReporte.forEach(d => {
-        worksheet.addRow([d.codigo, d.nombre, d.ingresos, d.egresos, d.saldo]);
-      });
-    }
+      // Agregar BOM para que Excel reconozca UTF-8
+      const BOM = '\uFEFF';
+      const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
 
-    const result = await window.electronAPI.export.selectPath({
-      defaultName: `Reporte_${tipoReporte}_${format(new Date(), 'yyyyMMdd')}.xlsx`,
-      filters: [{ name: 'Excel', extensions: ['xlsx'] }]
-    });
-
-    if (!result.canceled) {
-      const buffer = await workbook.xlsx.writeBuffer();
-      const fs = window.require('fs');
-      fs.writeFileSync(result.filePath, Buffer.from(buffer));
+      // Crear enlace de descarga
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `Reporte_${tipoReporte}_${format(new Date(), 'yyyyMMdd')}.csv`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (error) {
+      console.error('Error exportando Excel:', error);
     }
   };
 
   const exportarPDF = async () => {
-    const doc = new jsPDF();
+    try {
+      const doc = new jsPDF();
+      const periodoTexto = `${formatearFechaSegura(filtros.fechaInicio, 'dd/MM/yyyy')} - ${formatearFechaSegura(filtros.fechaFin, 'dd/MM/yyyy')}`;
 
-    doc.setFontSize(16);
-    doc.text(getTituloReporte(), 14, 20);
+      doc.setFontSize(16);
+      doc.text(getTituloReporte(), 14, 20);
 
-    doc.setFontSize(10);
-    doc.text(`Período: ${format(new Date(filtros.fechaInicio), 'dd/MM/yyyy')} - ${format(new Date(filtros.fechaFin), 'dd/MM/yyyy')}`, 14, 28);
+      doc.setFontSize(10);
+      doc.text(`Período: ${periodoTexto}`, 14, 28);
 
-    let columns, rows;
+      let columns, rows;
 
-    if (tipoReporte === 'periodo') {
-      columns = ['Período', 'Ingresos', 'Egresos', 'Saldo'];
-      rows = datosReporte.map(d => [d.periodo, formatMonto(d.ingresos), formatMonto(d.egresos), formatMonto(d.saldo)]);
-    } else if (tipoReporte === 'conceptoIngreso' || tipoReporte === 'conceptoEgreso') {
-      columns = ['Código', 'Concepto', 'Cantidad', 'Total'];
-      rows = datosReporte.map(d => [d.codigo, d.concepto?.substring(0, 40), d.cantidad, formatMonto(d.total)]);
-    } else {
-      columns = ['Código', 'Tercero', 'Ingresos', 'Egresos', 'Saldo'];
-      rows = datosReporte.map(d => [d.codigo, d.nombre?.substring(0, 25), formatMonto(d.ingresos), formatMonto(d.egresos), formatMonto(d.saldo)]);
-    }
+      if (tipoReporte === 'periodo') {
+        columns = ['Período', 'Ingresos', 'Egresos', 'Saldo'];
+        rows = datosReporte.map(d => [d.periodo, formatMonto(d.ingresos), formatMonto(d.egresos), formatMonto(d.saldo)]);
+      } else if (tipoReporte === 'conceptoIngreso' || tipoReporte === 'conceptoEgreso') {
+        columns = ['Código', 'Concepto', 'Cantidad', 'Total'];
+        rows = datosReporte.map(d => [d.codigo, d.concepto?.substring(0, 40), d.cantidad, formatMonto(d.total)]);
+      } else {
+        columns = ['Código', 'Tercero', 'Ingresos', 'Egresos', 'Saldo'];
+        rows = datosReporte.map(d => [d.codigo, d.nombre?.substring(0, 25), formatMonto(d.ingresos), formatMonto(d.egresos), formatMonto(d.saldo)]);
+      }
 
-    doc.autoTable({
-      startY: 35,
-      head: [columns],
-      body: rows,
-      styles: { fontSize: 8 },
-      headStyles: { fillColor: [26, 54, 93] }
-    });
+      doc.autoTable({
+        startY: 35,
+        head: [columns],
+        body: rows,
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [26, 54, 93] }
+      });
 
-    const result = await window.electronAPI.export.selectPath({
-      defaultName: `Reporte_${tipoReporte}_${format(new Date(), 'yyyyMMdd')}.pdf`,
-      filters: [{ name: 'PDF', extensions: ['pdf'] }]
-    });
-
-    if (!result.canceled) {
-      doc.save(result.filePath);
+      // Descargar directamente
+      doc.save(`Reporte_${tipoReporte}_${format(new Date(), 'yyyyMMdd')}.pdf`);
+    } catch (error) {
+      console.error('Error exportando PDF:', error);
     }
   };
 

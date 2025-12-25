@@ -14,10 +14,18 @@ import {
   FiCalendar,
   FiAlertCircle
 } from 'react-icons/fi';
-import { format, startOfMonth, endOfMonth, startOfYear } from 'date-fns';
-import ExcelJS from 'exceljs';
-import { jsPDF } from 'jspdf';
-import 'jspdf-autotable';
+import { format, startOfMonth, endOfMonth } from 'date-fns';
+
+// Componente para renderizar el badge de tipo
+const TipoCellRenderer = (props) => {
+  const tipo = props.value;
+  if (!tipo) return null;
+  return (
+    <span className={`badge badge-${tipo}`}>
+      {tipo === 'ingreso' ? 'Ingreso' : 'Egreso'}
+    </span>
+  );
+};
 
 const Movimientos = () => {
   const gridRef = useRef();
@@ -43,15 +51,12 @@ const Movimientos = () => {
 
   const [selectedRows, setSelectedRows] = useState([]);
   const [showNuevoModal, setShowNuevoModal] = useState(false);
-  const [editingRow, setEditingRow] = useState(null);
   const [totales, setTotales] = useState({ ingresos: 0, egresos: 0, saldo: 0 });
 
-  // Cargar datos filtrados
   useEffect(() => {
     cargarMovimientos();
   }, [filtros]);
 
-  // Calcular totales
   useEffect(() => {
     const ingresos = movimientos
       .filter(m => m.tipo === 'ingreso')
@@ -71,41 +76,38 @@ const Movimientos = () => {
     await refreshMovimientos(filtros);
   };
 
-  // Configuración de columnas para AG-Grid
   const columnDefs = useMemo(() => [
     {
       headerName: '',
-      field: 'checkbox',
       checkboxSelection: true,
       headerCheckboxSelection: true,
       width: 50,
-      pinned: 'left',
-      lockPosition: true
+      pinned: 'left'
     },
     {
       headerName: 'Fecha',
       field: 'fecha',
       width: 120,
       editable: true,
-      cellEditor: 'agDateCellEditor',
       valueFormatter: (params) => {
         if (!params.value) return '';
-        return format(new Date(params.value + 'T00:00:00'), 'dd/MM/yyyy');
+        try {
+          return format(new Date(params.value + 'T00:00:00'), 'dd/MM/yyyy');
+        } catch {
+          return params.value;
+        }
       },
       cellStyle: { fontWeight: 500 }
     },
     {
       headerName: 'Tipo',
       field: 'tipo',
-      width: 100,
+      width: 110,
       editable: true,
+      cellRenderer: TipoCellRenderer,
       cellEditor: 'agSelectCellEditor',
       cellEditorParams: {
         values: ['ingreso', 'egreso']
-      },
-      cellRenderer: (params) => {
-        const tipo = params.value;
-        return `<span class="badge badge-${tipo}">${tipo === 'ingreso' ? 'Ingreso' : 'Egreso'}</span>`;
       }
     },
     {
@@ -128,7 +130,6 @@ const Movimientos = () => {
       field: 'concepto_operacion',
       flex: 2,
       minWidth: 250,
-      editable: false,
       cellStyle: { fontSize: '12px' }
     },
     {
@@ -145,8 +146,7 @@ const Movimientos = () => {
       headerName: 'Tercero',
       field: 'nombre_tercero',
       flex: 1,
-      minWidth: 150,
-      editable: false
+      minWidth: 150
     },
     {
       headerName: 'Monto',
@@ -167,15 +167,13 @@ const Movimientos = () => {
       field: 'detalle',
       flex: 1,
       minWidth: 200,
-      editable: true,
-      cellEditor: 'agTextCellEditor'
+      editable: true
     },
     {
       headerName: 'Revisión',
       field: 'revision',
       width: 100,
-      editable: true,
-      cellEditor: 'agTextCellEditor'
+      editable: true
     }
   ], [codigosIngreso, codigosEgreso, terceros, formatMonto]);
 
@@ -185,13 +183,11 @@ const Movimientos = () => {
     resizable: true
   }), []);
 
-  // Manejar cambios en celdas
   const onCellValueChanged = useCallback(async (event) => {
     const { data, colDef, newValue, oldValue } = event;
 
     if (newValue === oldValue) return;
 
-    // Si cambió el tipo, actualizar el código de operación
     let updateData = { ...data };
 
     if (colDef.field === 'tipo') {
@@ -200,20 +196,18 @@ const Movimientos = () => {
         : codigosEgreso[0]?.codigo;
     }
 
-    // Si cambió el código de operación, actualizar el concepto
     if (colDef.field === 'codigo_operacion') {
       const codigos = data.tipo === 'ingreso' ? codigosIngreso : codigosEgreso;
       const codigo = codigos.find(c => c.codigo === newValue);
       updateData.concepto_operacion = codigo?.concepto || '';
     }
 
-    // Si cambió el código de tercero, actualizar el nombre
     if (colDef.field === 'codigo_tercero') {
       const tercero = terceros.find(t => t.codigo === newValue);
       updateData.nombre_tercero = tercero?.nombre || '';
     }
 
-    const result = await updateMovimiento(data.id, {
+    await updateMovimiento(data.id, {
       fecha: updateData.fecha,
       tipo: updateData.tipo,
       codigo_operacion: updateData.codigo_operacion,
@@ -222,149 +216,98 @@ const Movimientos = () => {
       detalle: updateData.detalle,
       revision: updateData.revision
     });
-
-    if (!result.success) {
-      // Revertir cambios
-      event.api.undoCellEditing();
-    }
   }, [codigosIngreso, codigosEgreso, terceros, updateMovimiento]);
 
-  // Manejar selección de filas
   const onSelectionChanged = useCallback(() => {
     const selectedNodes = gridRef.current.api.getSelectedNodes();
     setSelectedRows(selectedNodes.map(node => node.data));
   }, []);
 
-  // Eliminar movimientos seleccionados
   const handleDeleteSelected = async () => {
     if (selectedRows.length === 0) return;
-
-    if (!window.confirm(`¿Está seguro de eliminar ${selectedRows.length} movimiento(s)?`)) {
-      return;
-    }
+    if (!window.confirm(`¿Está seguro de eliminar ${selectedRows.length} movimiento(s)?`)) return;
 
     for (const row of selectedRows) {
       await deleteMovimiento(row.id);
     }
-
     setSelectedRows([]);
   };
 
-  // Exportar a Excel
+  // Exportar a Excel - usando descarga directa
   const exportToExcel = async () => {
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Movimientos');
-
-    // Configurar columnas
-    worksheet.columns = [
-      { header: 'Fecha', key: 'fecha', width: 12 },
-      { header: 'Tipo', key: 'tipo', width: 10 },
-      { header: 'Código', key: 'codigo_operacion', width: 10 },
-      { header: 'Concepto', key: 'concepto_operacion', width: 40 },
-      { header: 'Cód. Tercero', key: 'codigo_tercero', width: 12 },
-      { header: 'Tercero', key: 'nombre_tercero', width: 25 },
-      { header: 'Monto', key: 'monto', width: 15 },
-      { header: 'Detalle', key: 'detalle', width: 30 },
-      { header: 'Revisión', key: 'revision', width: 12 }
-    ];
-
-    // Estilo de encabezados
-    worksheet.getRow(1).font = { bold: true };
-    worksheet.getRow(1).fill = {
-      type: 'pattern',
-      pattern: 'solid',
-      fgColor: { argb: 'FF1A365D' }
-    };
-    worksheet.getRow(1).font = { color: { argb: 'FFFFFFFF' }, bold: true };
-
-    // Agregar datos
-    movimientos.forEach(mov => {
-      const row = worksheet.addRow({
-        fecha: format(new Date(mov.fecha + 'T00:00:00'), 'dd/MM/yyyy'),
-        tipo: mov.tipo === 'ingreso' ? 'Ingreso' : 'Egreso',
-        codigo_operacion: mov.codigo_operacion,
-        concepto_operacion: mov.concepto_operacion,
-        codigo_tercero: mov.codigo_tercero,
-        nombre_tercero: mov.nombre_tercero,
-        monto: mov.monto,
-        detalle: mov.detalle,
-        revision: mov.revision
-      });
-
-      // Color según tipo
-      if (mov.tipo === 'ingreso') {
-        row.getCell('monto').font = { color: { argb: 'FF48BB78' } };
-      } else {
-        row.getCell('monto').font = { color: { argb: 'FFF56565' } };
-      }
-    });
-
-    // Agregar totales
-    worksheet.addRow({});
-    const totalesRow = worksheet.addRow({
-      concepto_operacion: 'TOTALES:',
-      monto: totales.saldo
-    });
-    totalesRow.font = { bold: true };
-
-    // Formato de moneda
-    worksheet.getColumn('monto').numFmt = '"$"#,##0';
-
-    // Guardar archivo
-    const result = await window.electronAPI.export.selectPath({
-      defaultName: `Movimientos_${format(new Date(), 'yyyyMMdd')}.xlsx`,
-      filters: [{ name: 'Excel', extensions: ['xlsx'] }]
-    });
-
-    if (!result.canceled) {
-      const buffer = await workbook.xlsx.writeBuffer();
-      // En Electron, necesitamos usar el sistema de archivos
-      const fs = window.require('fs');
-      fs.writeFileSync(result.filePath, Buffer.from(buffer));
-      toast.success('Archivo Excel exportado correctamente');
-    }
-  };
-
-  // Exportar a PDF
-  const exportToPDF = async () => {
-    const doc = new jsPDF('l', 'mm', 'a4');
-
-    doc.setFontSize(18);
-    doc.text('Movimientos de Caja', 14, 22);
-
-    doc.setFontSize(10);
-    doc.text(`Período: ${format(new Date(filtros.fechaInicio), 'dd/MM/yyyy')} - ${format(new Date(filtros.fechaFin), 'dd/MM/yyyy')}`, 14, 30);
-
-    doc.autoTable({
-      startY: 35,
-      head: [['Fecha', 'Tipo', 'Código', 'Concepto', 'Tercero', 'Monto', 'Detalle']],
-      body: movimientos.map(mov => [
-        format(new Date(mov.fecha + 'T00:00:00'), 'dd/MM/yyyy'),
+    try {
+      // Crear CSV simple para compatibilidad
+      const headers = ['Fecha', 'Tipo', 'Código', 'Concepto', 'Cód. Tercero', 'Tercero', 'Monto', 'Detalle', 'Revisión'];
+      const rows = movimientos.map(mov => [
+        mov.fecha,
         mov.tipo === 'ingreso' ? 'Ingreso' : 'Egreso',
         mov.codigo_operacion,
-        mov.concepto_operacion?.substring(0, 30),
-        mov.nombre_tercero || '-',
-        formatMonto(mov.monto),
-        mov.detalle?.substring(0, 20) || ''
-      ]),
-      foot: [['', '', '', '', 'TOTAL:', formatMonto(totales.saldo), '']],
-      styles: { fontSize: 8 },
-      headStyles: { fillColor: [26, 54, 93] },
-      footStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0], fontStyle: 'bold' }
-    });
+        `"${(mov.concepto_operacion || '').replace(/"/g, '""')}"`,
+        mov.codigo_tercero || '',
+        `"${(mov.nombre_tercero || '').replace(/"/g, '""')}"`,
+        mov.monto,
+        `"${(mov.detalle || '').replace(/"/g, '""')}"`,
+        mov.revision || ''
+      ]);
 
-    const result = await window.electronAPI.export.selectPath({
-      defaultName: `Movimientos_${format(new Date(), 'yyyyMMdd')}.pdf`,
-      filters: [{ name: 'PDF', extensions: ['pdf'] }]
-    });
+      const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
 
-    if (!result.canceled) {
-      doc.save(result.filePath);
-      toast.success('Archivo PDF exportado correctamente');
+      // Agregar BOM para Excel reconozca UTF-8
+      const BOM = '\uFEFF';
+      const blob = new Blob([BOM + csvContent], { type: 'text/csv;charset=utf-8;' });
+
+      // Crear enlace de descarga
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `Movimientos_${format(new Date(), 'yyyyMMdd')}.csv`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+
+      toast.success('Archivo exportado correctamente');
+    } catch (error) {
+      toast.error('Error al exportar: ' + error.message);
     }
   };
 
-  // Calcular saldo acumulado para cada fila
+  // Exportar a PDF - usando jsPDF sin fs
+  const exportToPDF = async () => {
+    try {
+      const { jsPDF } = await import('jspdf');
+      await import('jspdf-autotable');
+
+      const doc = new jsPDF('l', 'mm', 'a4');
+
+      doc.setFontSize(18);
+      doc.text('Movimientos de Caja', 14, 22);
+
+      doc.setFontSize(10);
+      doc.text(`Período: ${filtros.fechaInicio} - ${filtros.fechaFin}`, 14, 30);
+
+      doc.autoTable({
+        startY: 35,
+        head: [['Fecha', 'Tipo', 'Código', 'Concepto', 'Tercero', 'Monto', 'Detalle']],
+        body: movimientos.map(mov => [
+          mov.fecha,
+          mov.tipo === 'ingreso' ? 'Ingreso' : 'Egreso',
+          mov.codigo_operacion,
+          (mov.concepto_operacion || '').substring(0, 30),
+          mov.nombre_tercero || '-',
+          formatMonto(mov.monto),
+          (mov.detalle || '').substring(0, 20)
+        ]),
+        foot: [['', '', '', '', 'TOTAL:', formatMonto(totales.saldo), '']],
+        styles: { fontSize: 8 },
+        headStyles: { fillColor: [26, 54, 93] },
+        footStyles: { fillColor: [240, 240, 240], textColor: [0, 0, 0], fontStyle: 'bold' }
+      });
+
+      doc.save(`Movimientos_${format(new Date(), 'yyyyMMdd')}.pdf`);
+      toast.success('PDF exportado correctamente');
+    } catch (error) {
+      toast.error('Error al exportar PDF: ' + error.message);
+    }
+  };
+
   const rowDataWithSaldo = useMemo(() => {
     let saldoAcumulado = 0;
     return [...movimientos].reverse().map(mov => {
@@ -482,7 +425,7 @@ const Movimientos = () => {
           animateRows={true}
           enableCellTextSelection={true}
           suppressRowClickSelection={true}
-          getRowId={(params) => params.data.id}
+          getRowId={(params) => String(params.data.id)}
           overlayNoRowsTemplate="<span>No hay movimientos para mostrar</span>"
         />
       </div>
@@ -502,7 +445,6 @@ const Movimientos = () => {
   );
 };
 
-// Componente Modal para nuevo movimiento
 const NuevoMovimientoModal = ({ onClose, onCreate, codigosIngreso, codigosEgreso, terceros, userId }) => {
   const [formData, setFormData] = useState({
     fecha: format(new Date(), 'yyyy-MM-dd'),
