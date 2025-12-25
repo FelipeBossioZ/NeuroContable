@@ -48,10 +48,11 @@ function createWindow() {
   });
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // Inicializar base de datos
   const dbPath = getDatabasePath();
   db = new Database(dbPath);
+  await db.init();
 
   createWindow();
 

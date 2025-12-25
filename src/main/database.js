@@ -1,25 +1,44 @@
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const fs = require('fs');
 
 class DatabaseManager {
   constructor(dbPath) {
+    this.dbPath = dbPath;
+    this.db = null;
+    this.initialized = false;
+  }
+
+  async init() {
+    if (this.initialized) return;
+
     // Asegurar que el directorio existe
-    const dir = path.dirname(dbPath);
+    const dir = path.dirname(this.dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL'); // Mejor rendimiento para múltiples accesos
-    this.initialize();
+    // Inicializar SQL.js
+    const SQL = await initSqlJs();
+
+    // Cargar base de datos existente o crear nueva
+    if (fs.existsSync(this.dbPath)) {
+      const fileBuffer = fs.readFileSync(this.dbPath);
+      this.db = new SQL.Database(fileBuffer);
+    } else {
+      this.db = new SQL.Database();
+    }
+
+    // Crear tablas
+    this.createTables();
+    this.insertarDatosIniciales();
+    this.save();
+    this.initialized = true;
   }
 
-  initialize() {
-    // Crear tablas
-    this.db.exec(`
-      -- Tabla de usuarios
+  createTables() {
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS usuarios (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre TEXT NOT NULL,
@@ -29,9 +48,10 @@ class DatabaseManager {
         activo INTEGER DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+      )
+    `);
 
-      -- Tabla de terceros (clientes/cuentas)
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS terceros (
         codigo TEXT PRIMARY KEY,
         nombre TEXT NOT NULL,
@@ -39,27 +59,30 @@ class DatabaseManager {
         tipo TEXT DEFAULT 'cliente',
         activo INTEGER DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+      )
+    `);
 
-      -- Tabla de códigos de ingreso
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS codigos_ingreso (
         codigo TEXT PRIMARY KEY,
         concepto TEXT NOT NULL,
         observaciones TEXT,
         activo INTEGER DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+      )
+    `);
 
-      -- Tabla de códigos de egreso
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS codigos_egreso (
         codigo TEXT PRIMARY KEY,
         concepto TEXT NOT NULL,
         observaciones TEXT,
         activo INTEGER DEFAULT 1,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-      );
+      )
+    `);
 
-      -- Tabla de movimientos
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS movimientos (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         fecha DATE NOT NULL,
@@ -71,185 +94,204 @@ class DatabaseManager {
         revision TEXT,
         usuario_id INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (codigo_tercero) REFERENCES terceros(codigo),
-        FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
-      );
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-      -- Índices para mejor rendimiento
-      CREATE INDEX IF NOT EXISTS idx_movimientos_fecha ON movimientos(fecha);
-      CREATE INDEX IF NOT EXISTS idx_movimientos_tipo ON movimientos(tipo);
-      CREATE INDEX IF NOT EXISTS idx_movimientos_codigo_operacion ON movimientos(codigo_operacion);
-      CREATE INDEX IF NOT EXISTS idx_movimientos_codigo_tercero ON movimientos(codigo_tercero);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_mov_fecha ON movimientos(fecha)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_mov_tipo ON movimientos(tipo)`);
 
-      -- Tabla de configuración
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS configuracion (
         clave TEXT PRIMARY KEY,
         valor TEXT
-      );
+      )
     `);
+  }
 
-    // Insertar datos iniciales si no existen
-    this.insertarDatosIniciales();
+  save() {
+    const data = this.db.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(this.dbPath, buffer);
+  }
+
+  // Helpers
+  get(sql, params = []) {
+    try {
+      const stmt = this.db.prepare(sql);
+      if (params.length > 0) stmt.bind(params);
+      if (stmt.step()) {
+        const row = stmt.getAsObject();
+        stmt.free();
+        return row;
+      }
+      stmt.free();
+      return null;
+    } catch (error) {
+      console.error('DB get error:', error);
+      return null;
+    }
+  }
+
+  all(sql, params = []) {
+    try {
+      const stmt = this.db.prepare(sql);
+      if (params.length > 0) stmt.bind(params);
+      const results = [];
+      while (stmt.step()) {
+        results.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return results;
+    } catch (error) {
+      console.error('DB all error:', error);
+      return [];
+    }
+  }
+
+  run(sql, params = []) {
+    try {
+      this.db.run(sql, params);
+      this.save();
+      return { success: true };
+    } catch (error) {
+      console.error('DB run error:', error);
+      return { success: false, message: error.message };
+    }
   }
 
   insertarDatosIniciales() {
-    // Verificar si ya hay usuarios
-    const userCount = this.db.prepare('SELECT COUNT(*) as count FROM usuarios').get();
-    if (userCount.count === 0) {
-      // Crear usuario admin por defecto
+    // Usuario admin
+    const userCount = this.get('SELECT COUNT(*) as count FROM usuarios');
+    if (!userCount || userCount.count === 0) {
       const hash = bcrypt.hashSync('admin123', 10);
-      this.db.prepare(`
-        INSERT INTO usuarios (nombre, email, password_hash, rol)
-        VALUES (?, ?, ?, ?)
-      `).run('Administrador', 'admin@neurocontable.com', hash, 'admin');
+      this.db.run(`INSERT INTO usuarios (nombre, email, password_hash, rol) VALUES (?, ?, ?, ?)`,
+        ['Administrador', 'admin@neurocontable.com', hash, 'admin']);
     }
 
-    // Verificar si ya hay terceros
-    const terceroCount = this.db.prepare('SELECT COUNT(*) as count FROM terceros').get();
-    if (terceroCount.count === 0) {
+    // Terceros
+    const terceroCount = this.get('SELECT COUNT(*) as count FROM terceros');
+    if (!terceroCount || terceroCount.count === 0) {
       const terceros = [
-        ['0', 'CONSIGNACIÓN POR IDENTIFICAR', 'Consignaciones pendientes de identificar', 'sistema'],
+        ['0', 'CONSIGNACIÓN POR IDENTIFICAR', 'Consignaciones pendientes', 'sistema'],
         ['1', 'Cuenta 1 - DAFF', 'Cuenta bancaria DAFF', 'cuenta'],
         ['2', 'Cuenta 2 - GTFF', 'Cuenta bancaria GTFF', 'cuenta'],
         ['3', 'PARA CLIENTE', 'Movimientos para clientes', 'cliente'],
         ['4', 'PARA CLIENTE', 'Movimientos para clientes', 'cliente'],
         ['5', 'PARA CLIENTE', 'Movimientos para clientes', 'cliente']
       ];
-
-      const stmt = this.db.prepare(`
-        INSERT INTO terceros (codigo, nombre, descripcion, tipo) VALUES (?, ?, ?, ?)
-      `);
-
-      terceros.forEach(t => stmt.run(...t));
+      terceros.forEach(t => {
+        this.db.run(`INSERT INTO terceros (codigo, nombre, descripcion, tipo) VALUES (?, ?, ?, ?)`, t);
+      });
     }
 
-    // Verificar si ya hay códigos de ingreso
-    const ingresoCount = this.db.prepare('SELECT COUNT(*) as count FROM codigos_ingreso').get();
-    if (ingresoCount.count === 0) {
-      const codigosIngreso = [
-        ['A', 'Recibido por: -FACTURAS -GTFF', 'Abonan o cancelan facturación de GTFF'],
-        ['B', 'Recibido por: -Cuentas de cobro -GTFF', 'Abonan o cancelan cuentas de cobro de GTFF'],
-        ['C', 'Recibido por: -Cuentas de cobro -DAFF', 'Abonan o cancelan cuentas de cobro de DAFF'],
-        ['D', 'Recibido por: -Otros ingresos Sin Facturación', 'Pagos sin factura: asesorías, GMF, propinas, regalos, aguinaldos, reintegros'],
-        ['E', 'Ingresos Recibidos de terceros para pagos', 'Dineros consignados por terceros para destino específico'],
-        ['F', 'Recibido por: -Cuentas por Cobrar', 'Abonan o cancelan dineros prestados o cuentas por cobrar diferentes a facturación'],
-        ['G', 'Recibido por: -Abono a préstamos por Nómina de:', 'Abono o cancelación de préstamos de Diego A. Fernández F.'],
-        ['H', 'Recibido por: -Abono a préstamos por Nómina de:', 'Abono o cancelación de préstamos de Felipe Bossio Zapata'],
-        ['I', '-Retiros y Traslados de Bancos', 'Traslados y retiros de cuentas bancarias que entran a caja'],
-        ['J', '-Consignaciones pendientes de identificar', 'Consignaciones sin identificar, uso provisional'],
-        ['K', 'Recibido por: -Préstamos a favor de la oficina', 'Dineros por préstamos que le hagan a GTFF'],
-        ['L', 'Reembolsos y recuperaciones', 'Reembolsos y recuperaciones'],
-        ['M', 'Recibido por: -Abono a préstamos', 'Abono o cancelación de préstamos de Juliana Fernández F.'],
-        ['N', 'Pago bonificaciones', 'Solo para el pago de la bonificación al final del año'],
-        ['O', 'Recibido por: -Préstamos de Juliana Fernandez', 'Dineros por préstamos de Juliana Fernández a la oficina'],
-        ['P', 'Recibido por: aguinaldos', 'Aguinaldos para Empleado 1'],
-        ['Q', 'Recibido por: aguinaldos', 'Aguinaldos para Empleado 2'],
-        ['R', 'Recibido por: aguinaldos', 'Aguinaldos para Empleado 3']
+    // Códigos de ingreso
+    const ingresoCount = this.get('SELECT COUNT(*) as count FROM codigos_ingreso');
+    if (!ingresoCount || ingresoCount.count === 0) {
+      const codigos = [
+        ['A', 'Recibido por: -FACTURAS -GTFF', 'Facturación de GTFF'],
+        ['B', 'Recibido por: -Cuentas de cobro -GTFF', 'Cuentas de cobro GTFF'],
+        ['C', 'Recibido por: -Cuentas de cobro -DAFF', 'Cuentas de cobro DAFF'],
+        ['D', 'Recibido por: -Otros ingresos Sin Facturación', 'Pagos sin factura'],
+        ['E', 'Ingresos Recibidos de terceros para pagos', 'Dineros de terceros'],
+        ['F', 'Recibido por: -Cuentas por Cobrar', 'Dineros prestados'],
+        ['G', 'Recibido por: -Abono a préstamos por Nómina', 'Préstamos Diego'],
+        ['H', 'Recibido por: -Abono a préstamos por Nómina', 'Préstamos Felipe'],
+        ['I', '-Retiros y Traslados de Bancos', 'Retiros bancarios'],
+        ['J', '-Consignaciones pendientes de identificar', 'Sin identificar'],
+        ['K', 'Recibido por: -Préstamos a favor de la oficina', 'Préstamos a GTFF'],
+        ['L', 'Reembolsos y recuperaciones', 'Reembolsos'],
+        ['M', 'Recibido por: -Abono a préstamos', 'Préstamos Juliana'],
+        ['N', 'Pago bonificaciones', 'Bonificación anual'],
+        ['O', 'Recibido por: -Préstamos de Juliana', 'Préstamos Juliana'],
+        ['P', 'Recibido por: aguinaldos', 'Aguinaldos Emp 1'],
+        ['Q', 'Recibido por: aguinaldos', 'Aguinaldos Emp 2'],
+        ['R', 'Recibido por: aguinaldos', 'Aguinaldos Emp 3']
       ];
-
-      const stmt = this.db.prepare(`
-        INSERT INTO codigos_ingreso (codigo, concepto, observaciones) VALUES (?, ?, ?)
-      `);
-
-      codigosIngreso.forEach(c => stmt.run(...c));
+      codigos.forEach(c => {
+        this.db.run(`INSERT INTO codigos_ingreso (codigo, concepto, observaciones) VALUES (?, ?, ?)`, c);
+      });
     }
 
-    // Verificar si ya hay códigos de egreso
-    const egresoCount = this.db.prepare('SELECT COUNT(*) as count FROM codigos_egreso').get();
-    if (egresoCount.count === 0) {
-      const codigosEgreso = [
-        ['1', 'Gastos personales', 'Gastos exclusivamente personales que no tengan que ver con la familia, oficina y Barbosa'],
-        ['2', 'Pago de Salarios a:', 'Se pagan los Salarios cada semana'],
-        ['3', 'Pago de Prestaciones sociales a:', 'Se pagan las Liquidaciones del personal al final del año o por retiro'],
-        ['4', 'Pago de Bonificación a:', 'Se pagan Bonificaciones no incluidas en las liquidaciones del personal'],
-        ['5', 'Préstamos por Nómina a:', 'Se desembolsan préstamos a Diego A. Fernández F.'],
-        ['6', 'Préstamos por Nómina a:', 'Se desembolsan préstamos a Felipe Bossio Zapata'],
-        ['7', 'Pagos de: -Seguridad Social', 'Se pagan los aportes a la seguridad social de la oficina y personal cada mes'],
-        ['8', 'Pagos de: -Cuota para alimentos y Manutención', 'Se hacen pagos a Libia y las niñas, a Choly, a Omar, a Juliana y DAFF'],
-        ['9', 'Pagos de: -Servicios públicos -OFICINA-', 'Se hacen pagos sólo de UNE y EPM que tengan que ver con la Oficina'],
-        ['10', 'Pagos de: -Servicios públicos -NIÑAS-', 'Se hacen pagos sólo de UNE y EPM de que tengan que ver con Babilonia'],
-        ['11', 'Pagos de: -Servicios Administración y otros Oficina', 'Se hacen pagos sólo de UNE y EPM de que tengan que ver con Ermita'],
-        ['12', 'Pagos de: -Celulares', 'Se pagan los celulares de Libia y GTFF, (se debe discriminar por tercero)'],
-        ['13', 'Pagos de: -Suscripciones', 'Se paga el trimestre de CETA'],
-        ['14', 'Pagos de: -Seminarios y capacitaciones', 'Se pagan por la asistencia a seminarios'],
-        ['15', 'Pagos de: -Mantenimiento de equipos y telefonía', 'Se paga por el mantenimiento de computadores, teléfonos y reparación de equipos'],
-        ['16', 'Pagos de: -Aguinaldos y Propinas', 'Se pagan Propinas (Agua) y aguinaldos al fin del año'],
-        ['17', 'Pagos de: -Sanciones e intereses asumidos', 'Se pagan por cuenta de la oficina impuestos, sanciones e intereses al asumir por un error cometido'],
-        ['18', 'Pagos de: -Pasajes y transportes', 'Se pagan pasajes y demás, si no se van a cobrar se le carga al tercero de la oficina'],
-        ['19', 'Pagos de: -Gastos Barbosa', 'Se pagan todo lo que tenga que ver con Barbosa como pagos a EPM, acueductos y pagos para ALFF'],
-        ['20', 'Pagos de: -Demás Gastos oficina', 'Se pagan gastos como Aseo y demás extraordinarios y no clasificados'],
-        ['21', 'Pagos de: -Cuentas por Pagar a:', 'Se hacen abonos o cancelaciones de platas que debe la oficina'],
-        ['22', 'Compra de: -Equipos, dotaciones y repuestos para oficina', 'Sólo para la oficina o GTFF'],
-        ['23', 'Compra de: -Útiles de aseo', 'Sólo para gastos de la oficina, si son para GTFF van en el código (1)'],
-        ['24', 'Compra de: -Papelería', 'Sólo para gastos de la oficina, si son para GTFF van en el código (1)'],
-        ['25', 'Compra de: -Manuales, Libros y formularios', 'Sólo para gastos de la oficina, si son para GTFF van en el código (1)'],
-        ['26', 'Compra de: -Drogas y farmacia', 'Sólo para gastos de la oficina, si son para GTFF van en el código (1)'],
-        ['27', 'Compra de: -Restaurante y cafetería', 'Sólo para gastos de la oficina, si son para GTFF van en el código (1)'],
-        ['28', 'Préstamos a:', 'Se desembolsa o presta plata a personas distintas a los clientes (Terceros)'],
-        ['29', 'Egresos por Cuenta de Terceros -Pagos impuestos-', 'Se presta plata a los clientes (Terceros) para pagarles cualquier tipo de Impuestos'],
-        ['30', 'Egresos por Cuenta de Terceros -Seguridad social-', 'Se presta plata a los clientes (Terceros) para pagarles la seguridad social'],
-        ['31', 'Egresos por Cuenta de Terceros -Certificados y otros', 'Se presta plata a los clientes (Terceros) para comprarles cualquier tipo de certificado'],
-        ['32', 'Egresos por Cuenta de Terceros -Mantenimiento o compras de equipos y repuestos', 'Se presta plata a los clientes (Terceros) para comprarles o pagarles mantenimiento de equipos'],
-        ['33', 'AJUSTE POR -Consignación - Traslado a Bancos', 'Se hace por consignaciones a las cuentas de Bancolombia (GTFF, DAFF y Choly)'],
-        ['34', 'AJUSTE POR -Consignaciones pendientes de identificar', 'Se reciben consignaciones sin identificar, se asienta en el gasto para no distorsionar la caja'],
-        ['35', 'Impuestos, tasas y contribuciones -GTFF-', 'Se hacen pagos de IVA, Predial, de demás impuestos a nombre de GTFF'],
-        ['36', 'Pago en efectivo', 'de las Facturas GTFF y las cuentas de cobro DAFF'],
-        ['37', 'Gastos Barbosa', 'Gastos de Barbosa'],
-        ['38', 'Pagos de bonificaciones', 'Sólo para el pago de la bonificación al final del año'],
-        ['39', 'Pago intereses préstamo Juliana', 'Se hacen abonos a los intereses del préstamo de Juliana María Fernández Fernández'],
-        ['40', 'Rembolso por retención en la fuente no descontadas', 'Rembolso de la retención en la fuente de las facturas de GTFF que el cliente no descuenta'],
-        ['41', 'AJUSTE POR -aguinaldos a la empresa y otros', 'Ajustes por aguinaldos a la empresa'],
-        ['42', 'AJUSTE POR -Cruce de cuentas', 'Ajustes por cruce de cuentas'],
-        ['43', 'Pago Hipotecario BANCOLOMBIA', 'Pago del crédito hipotecario Bancolombia'],
-        ['44', 'Gastos Oficina Arriendo', 'Gastos de arriendo de la oficina']
+    // Códigos de egreso
+    const egresoCount = this.get('SELECT COUNT(*) as count FROM codigos_egreso');
+    if (!egresoCount || egresoCount.count === 0) {
+      const codigos = [
+        ['1', 'Gastos personales', 'Gastos personales'],
+        ['2', 'Pago de Salarios a:', 'Salarios semanales'],
+        ['3', 'Pago de Prestaciones sociales a:', 'Liquidaciones'],
+        ['4', 'Pago de Bonificación a:', 'Bonificaciones'],
+        ['5', 'Préstamos por Nómina a:', 'Préstamos Diego'],
+        ['6', 'Préstamos por Nómina a:', 'Préstamos Felipe'],
+        ['7', 'Pagos de: -Seguridad Social', 'Seguridad social'],
+        ['8', 'Pagos de: -Cuota alimentos', 'Alimentos familia'],
+        ['9', 'Pagos de: -Servicios públicos OFICINA', 'Servicios oficina'],
+        ['10', 'Pagos de: -Servicios públicos NIÑAS', 'Servicios Babilonia'],
+        ['11', 'Pagos de: -Servicios Administración', 'Servicios Ermita'],
+        ['12', 'Pagos de: -Celulares', 'Celulares'],
+        ['13', 'Pagos de: -Suscripciones', 'CETA'],
+        ['14', 'Pagos de: -Seminarios', 'Capacitaciones'],
+        ['15', 'Pagos de: -Mantenimiento equipos', 'Computadores'],
+        ['16', 'Pagos de: -Aguinaldos y Propinas', 'Aguinaldos'],
+        ['17', 'Pagos de: -Sanciones e intereses', 'Sanciones'],
+        ['18', 'Pagos de: -Pasajes y transportes', 'Transportes'],
+        ['19', 'Pagos de: -Gastos Barbosa', 'Barbosa'],
+        ['20', 'Pagos de: -Demás Gastos oficina', 'Otros gastos'],
+        ['21', 'Pagos de: -Cuentas por Pagar', 'Deudas oficina'],
+        ['22', 'Compra de: -Equipos oficina', 'Equipos'],
+        ['23', 'Compra de: -Útiles de aseo', 'Aseo'],
+        ['24', 'Compra de: -Papelería', 'Papelería'],
+        ['25', 'Compra de: -Manuales y Libros', 'Libros'],
+        ['26', 'Compra de: -Drogas y farmacia', 'Farmacia'],
+        ['27', 'Compra de: -Restaurante', 'Restaurante'],
+        ['28', 'Préstamos a:', 'Préstamos terceros'],
+        ['29', 'Egresos Terceros -Impuestos-', 'Impuestos clientes'],
+        ['30', 'Egresos Terceros -Seguridad social-', 'Seg social clientes'],
+        ['31', 'Egresos Terceros -Certificados-', 'Certificados'],
+        ['32', 'Egresos Terceros -Mantenimiento-', 'Equipos clientes'],
+        ['33', 'AJUSTE POR -Consignación Bancos', 'Consignaciones'],
+        ['34', 'AJUSTE POR -Consignaciones por identificar', 'Sin identificar'],
+        ['35', 'Impuestos GTFF', 'IVA, Predial'],
+        ['36', 'Pago en efectivo', 'Facturas efectivo'],
+        ['37', 'Gastos Barbosa', 'Barbosa'],
+        ['38', 'Pagos de bonificaciones', 'Bonificaciones'],
+        ['39', 'Pago intereses préstamo Juliana', 'Intereses Juliana'],
+        ['40', 'Rembolso retención fuente', 'Retención'],
+        ['41', 'AJUSTE POR -aguinaldos empresa', 'Aguinaldos'],
+        ['42', 'AJUSTE POR -Cruce cuentas', 'Cruce'],
+        ['43', 'Pago Hipotecario BANCOLOMBIA', 'Hipoteca'],
+        ['44', 'Gastos Oficina Arriendo', 'Arriendo']
       ];
-
-      const stmt = this.db.prepare(`
-        INSERT INTO codigos_egreso (codigo, concepto, observaciones) VALUES (?, ?, ?)
-      `);
-
-      codigosEgreso.forEach(c => stmt.run(...c));
-    }
-
-    // Insertar año actual en configuración
-    const config = this.db.prepare('SELECT * FROM configuracion WHERE clave = ?').get('ano_actual');
-    if (!config) {
-      this.db.prepare('INSERT INTO configuracion (clave, valor) VALUES (?, ?)')
-        .run('ano_actual', new Date().getFullYear().toString());
+      codigos.forEach(c => {
+        this.db.run(`INSERT INTO codigos_egreso (codigo, concepto, observaciones) VALUES (?, ?, ?)`, c);
+      });
     }
   }
 
   // ============== AUTENTICACIÓN ==============
   login(email, password) {
-    const user = this.db.prepare('SELECT * FROM usuarios WHERE email = ? AND activo = 1').get(email);
+    const user = this.get('SELECT * FROM usuarios WHERE email = ? AND activo = 1', [email]);
     if (!user) {
       return { success: false, message: 'Usuario no encontrado' };
     }
-
     if (!bcrypt.compareSync(password, user.password_hash)) {
       return { success: false, message: 'Contraseña incorrecta' };
     }
-
     const { password_hash, ...userData } = user;
     return { success: true, user: userData };
   }
 
   getUsers() {
-    return this.db.prepare(`
-      SELECT id, nombre, email, rol, activo, created_at
-      FROM usuarios ORDER BY nombre
-    `).all();
+    return this.all('SELECT id, nombre, email, rol, activo, created_at FROM usuarios ORDER BY nombre');
   }
 
   createUser({ nombre, email, password, rol }) {
     try {
       const hash = bcrypt.hashSync(password, 10);
-      const result = this.db.prepare(`
-        INSERT INTO usuarios (nombre, email, password_hash, rol)
-        VALUES (?, ?, ?, ?)
-      `).run(nombre, email, hash, rol);
-      return { success: true, id: result.lastInsertRowid };
+      this.db.run(`INSERT INTO usuarios (nombre, email, password_hash, rol) VALUES (?, ?, ?, ?)`,
+        [nombre, email, hash, rol]);
+      this.save();
+      return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
     }
@@ -259,16 +301,13 @@ class DatabaseManager {
     try {
       if (password) {
         const hash = bcrypt.hashSync(password, 10);
-        this.db.prepare(`
-          UPDATE usuarios SET nombre = ?, email = ?, password_hash = ?, rol = ?, activo = ?, updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(nombre, email, hash, rol, activo ? 1 : 0, id);
+        this.db.run(`UPDATE usuarios SET nombre=?, email=?, password_hash=?, rol=?, activo=? WHERE id=?`,
+          [nombre, email, hash, rol, activo ? 1 : 0, id]);
       } else {
-        this.db.prepare(`
-          UPDATE usuarios SET nombre = ?, email = ?, rol = ?, activo = ?, updated_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `).run(nombre, email, rol, activo ? 1 : 0, id);
+        this.db.run(`UPDATE usuarios SET nombre=?, email=?, rol=?, activo=? WHERE id=?`,
+          [nombre, email, rol, activo ? 1 : 0, id]);
       }
+      this.save();
       return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
@@ -276,25 +315,21 @@ class DatabaseManager {
   }
 
   deleteUser(id) {
-    try {
-      this.db.prepare('DELETE FROM usuarios WHERE id = ?').run(id);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run('DELETE FROM usuarios WHERE id = ?', [id]);
+    this.save();
+    return { success: true };
   }
 
   // ============== TERCEROS ==============
   getTerceros() {
-    return this.db.prepare('SELECT * FROM terceros WHERE activo = 1 ORDER BY codigo').all();
+    return this.all('SELECT * FROM terceros WHERE activo = 1 ORDER BY codigo');
   }
 
   createTercero({ codigo, nombre, descripcion, tipo }) {
     try {
-      this.db.prepare(`
-        INSERT INTO terceros (codigo, nombre, descripcion, tipo)
-        VALUES (?, ?, ?, ?)
-      `).run(codigo, nombre, descripcion || '', tipo || 'cliente');
+      this.db.run(`INSERT INTO terceros (codigo, nombre, descripcion, tipo) VALUES (?, ?, ?, ?)`,
+        [codigo, nombre, descripcion || '', tipo || 'cliente']);
+      this.save();
       return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
@@ -302,37 +337,28 @@ class DatabaseManager {
   }
 
   updateTercero(codigo, { nombre, descripcion, tipo }) {
-    try {
-      this.db.prepare(`
-        UPDATE terceros SET nombre = ?, descripcion = ?, tipo = ?
-        WHERE codigo = ?
-      `).run(nombre, descripcion, tipo, codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run(`UPDATE terceros SET nombre=?, descripcion=?, tipo=? WHERE codigo=?`,
+      [nombre, descripcion, tipo, codigo]);
+    this.save();
+    return { success: true };
   }
 
   deleteTercero(codigo) {
-    try {
-      this.db.prepare('UPDATE terceros SET activo = 0 WHERE codigo = ?').run(codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run('UPDATE terceros SET activo = 0 WHERE codigo = ?', [codigo]);
+    this.save();
+    return { success: true };
   }
 
-  // ============== CÓDIGOS DE INGRESO ==============
+  // ============== CÓDIGOS INGRESO ==============
   getCodigosIngreso() {
-    return this.db.prepare('SELECT * FROM codigos_ingreso WHERE activo = 1 ORDER BY codigo').all();
+    return this.all('SELECT * FROM codigos_ingreso WHERE activo = 1 ORDER BY codigo');
   }
 
   createCodigoIngreso({ codigo, concepto, observaciones }) {
     try {
-      this.db.prepare(`
-        INSERT INTO codigos_ingreso (codigo, concepto, observaciones)
-        VALUES (?, ?, ?)
-      `).run(codigo, concepto, observaciones || '');
+      this.db.run(`INSERT INTO codigos_ingreso (codigo, concepto, observaciones) VALUES (?, ?, ?)`,
+        [codigo, concepto, observaciones || '']);
+      this.save();
       return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
@@ -340,37 +366,28 @@ class DatabaseManager {
   }
 
   updateCodigoIngreso(codigo, { concepto, observaciones }) {
-    try {
-      this.db.prepare(`
-        UPDATE codigos_ingreso SET concepto = ?, observaciones = ?
-        WHERE codigo = ?
-      `).run(concepto, observaciones, codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run(`UPDATE codigos_ingreso SET concepto=?, observaciones=? WHERE codigo=?`,
+      [concepto, observaciones, codigo]);
+    this.save();
+    return { success: true };
   }
 
   deleteCodigoIngreso(codigo) {
-    try {
-      this.db.prepare('UPDATE codigos_ingreso SET activo = 0 WHERE codigo = ?').run(codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run('UPDATE codigos_ingreso SET activo = 0 WHERE codigo = ?', [codigo]);
+    this.save();
+    return { success: true };
   }
 
-  // ============== CÓDIGOS DE EGRESO ==============
+  // ============== CÓDIGOS EGRESO ==============
   getCodigosEgreso() {
-    return this.db.prepare('SELECT * FROM codigos_egreso WHERE activo = 1 ORDER BY CAST(codigo AS INTEGER)').all();
+    return this.all('SELECT * FROM codigos_egreso WHERE activo = 1 ORDER BY CAST(codigo AS INTEGER)');
   }
 
   createCodigoEgreso({ codigo, concepto, observaciones }) {
     try {
-      this.db.prepare(`
-        INSERT INTO codigos_egreso (codigo, concepto, observaciones)
-        VALUES (?, ?, ?)
-      `).run(codigo, concepto, observaciones || '');
+      this.db.run(`INSERT INTO codigos_egreso (codigo, concepto, observaciones) VALUES (?, ?, ?)`,
+        [codigo, concepto, observaciones || '']);
+      this.save();
       return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
@@ -378,35 +395,23 @@ class DatabaseManager {
   }
 
   updateCodigoEgreso(codigo, { concepto, observaciones }) {
-    try {
-      this.db.prepare(`
-        UPDATE codigos_egreso SET concepto = ?, observaciones = ?
-        WHERE codigo = ?
-      `).run(concepto, observaciones, codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run(`UPDATE codigos_egreso SET concepto=?, observaciones=? WHERE codigo=?`,
+      [concepto, observaciones, codigo]);
+    this.save();
+    return { success: true };
   }
 
   deleteCodigoEgreso(codigo) {
-    try {
-      this.db.prepare('UPDATE codigos_egreso SET activo = 0 WHERE codigo = ?').run(codigo);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run('UPDATE codigos_egreso SET activo = 0 WHERE codigo = ?', [codigo]);
+    this.save();
+    return { success: true };
   }
 
   // ============== MOVIMIENTOS ==============
   getMovimientos(filtros = {}) {
     let sql = `
-      SELECT
-        m.*,
-        CASE
-          WHEN m.tipo = 'ingreso' THEN ci.concepto
-          ELSE ce.concepto
-        END as concepto_operacion,
+      SELECT m.*,
+        CASE WHEN m.tipo = 'ingreso' THEN ci.concepto ELSE ce.concepto END as concepto_operacion,
         t.nombre as nombre_tercero
       FROM movimientos m
       LEFT JOIN codigos_ingreso ci ON m.tipo = 'ingreso' AND m.codigo_operacion = ci.codigo
@@ -415,70 +420,38 @@ class DatabaseManager {
       WHERE 1=1
     `;
 
-    const params = [];
-
-    if (filtros.fechaInicio) {
-      sql += ' AND m.fecha >= ?';
-      params.push(filtros.fechaInicio);
-    }
-
-    if (filtros.fechaFin) {
-      sql += ' AND m.fecha <= ?';
-      params.push(filtros.fechaFin);
-    }
-
-    if (filtros.tipo) {
-      sql += ' AND m.tipo = ?';
-      params.push(filtros.tipo);
-    }
-
-    if (filtros.codigoOperacion) {
-      sql += ' AND m.codigo_operacion = ?';
-      params.push(filtros.codigoOperacion);
-    }
-
-    if (filtros.codigoTercero) {
-      sql += ' AND m.codigo_tercero = ?';
-      params.push(filtros.codigoTercero);
-    }
+    if (filtros.fechaInicio) sql += ` AND m.fecha >= '${filtros.fechaInicio}'`;
+    if (filtros.fechaFin) sql += ` AND m.fecha <= '${filtros.fechaFin}'`;
+    if (filtros.tipo) sql += ` AND m.tipo = '${filtros.tipo}'`;
+    if (filtros.codigoTercero) sql += ` AND m.codigo_tercero = '${filtros.codigoTercero}'`;
 
     sql += ' ORDER BY m.fecha DESC, m.id DESC';
-
-    return this.db.prepare(sql).all(...params);
+    return this.all(sql);
   }
 
   createMovimiento({ fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision, usuario_id }) {
     try {
-      const result = this.db.prepare(`
-        INSERT INTO movimientos (fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision, usuario_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle || '', revision || '', usuario_id);
-      return { success: true, id: result.lastInsertRowid };
+      this.db.run(`INSERT INTO movimientos (fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision, usuario_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle || '', revision || '', usuario_id]);
+      this.save();
+      return { success: true };
     } catch (error) {
       return { success: false, message: error.message };
     }
   }
 
   updateMovimiento(id, { fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision }) {
-    try {
-      this.db.prepare(`
-        UPDATE movimientos
-        SET fecha = ?, tipo = ?, codigo_operacion = ?, codigo_tercero = ?, monto = ?, detalle = ?, revision = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).run(fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision, id);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run(`UPDATE movimientos SET fecha=?, tipo=?, codigo_operacion=?, codigo_tercero=?, monto=?, detalle=?, revision=? WHERE id=?`,
+      [fecha, tipo, codigo_operacion, codigo_tercero, monto, detalle, revision, id]);
+    this.save();
+    return { success: true };
   }
 
   deleteMovimiento(id) {
-    try {
-      this.db.prepare('DELETE FROM movimientos WHERE id = ?').run(id);
-      return { success: true };
-    } catch (error) {
-      return { success: false, message: error.message };
-    }
+    this.db.run('DELETE FROM movimientos WHERE id = ?', [id]);
+    this.save();
+    return { success: true };
   }
 
   getMovimientosByDateRange(fechaInicio, fechaFin) {
@@ -487,158 +460,106 @@ class DatabaseManager {
 
   // ============== SALDOS ==============
   getSaldosByCuenta() {
-    return this.db.prepare(`
-      SELECT
-        t.codigo,
-        t.nombre,
+    return this.all(`
+      SELECT t.codigo, t.nombre,
         COALESCE(SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE 0 END), 0) as total_ingresos,
         COALESCE(SUM(CASE WHEN m.tipo = 'egreso' THEN m.monto ELSE 0 END), 0) as total_egresos,
         COALESCE(SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE -m.monto END), 0) as saldo
       FROM terceros t
       LEFT JOIN movimientos m ON t.codigo = m.codigo_tercero
       WHERE t.activo = 1 AND t.tipo = 'cuenta'
-      GROUP BY t.codigo, t.nombre
-      ORDER BY t.codigo
-    `).all();
+      GROUP BY t.codigo, t.nombre ORDER BY t.codigo
+    `);
   }
 
   getSaldosByTercero() {
-    return this.db.prepare(`
-      SELECT
-        t.codigo,
-        t.nombre,
-        t.tipo,
+    return this.all(`
+      SELECT t.codigo, t.nombre, t.tipo,
         COALESCE(SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE 0 END), 0) as total_ingresos,
         COALESCE(SUM(CASE WHEN m.tipo = 'egreso' THEN m.monto ELSE 0 END), 0) as total_egresos,
         COALESCE(SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE -m.monto END), 0) as saldo
       FROM terceros t
       LEFT JOIN movimientos m ON t.codigo = m.codigo_tercero
       WHERE t.activo = 1
-      GROUP BY t.codigo, t.nombre, t.tipo
-      ORDER BY t.codigo
-    `).all();
+      GROUP BY t.codigo, t.nombre, t.tipo ORDER BY t.codigo
+    `);
   }
 
   getSaldoGeneral() {
-    const result = this.db.prepare(`
+    const result = this.get(`
       SELECT
         COALESCE(SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE 0 END), 0) as total_ingresos,
         COALESCE(SUM(CASE WHEN tipo = 'egreso' THEN monto ELSE 0 END), 0) as total_egresos,
         COALESCE(SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE -monto END), 0) as saldo
       FROM movimientos
-    `).get();
-    return result;
+    `);
+    return result || { total_ingresos: 0, total_egresos: 0, saldo: 0 };
   }
 
   // ============== REPORTES ==============
   getResumenPorConcepto(fechaInicio, fechaFin, tipo) {
-    let sql;
-    if (tipo === 'ingreso') {
-      sql = `
-        SELECT
-          ci.codigo,
-          ci.concepto,
-          COUNT(m.id) as cantidad,
-          COALESCE(SUM(m.monto), 0) as total
-        FROM codigos_ingreso ci
-        LEFT JOIN movimientos m ON ci.codigo = m.codigo_operacion AND m.tipo = 'ingreso'
-          AND m.fecha BETWEEN ? AND ?
-        WHERE ci.activo = 1
-        GROUP BY ci.codigo, ci.concepto
-        ORDER BY total DESC
-      `;
-    } else {
-      sql = `
-        SELECT
-          ce.codigo,
-          ce.concepto,
-          COUNT(m.id) as cantidad,
-          COALESCE(SUM(m.monto), 0) as total
-        FROM codigos_egreso ce
-        LEFT JOIN movimientos m ON ce.codigo = m.codigo_operacion AND m.tipo = 'egreso'
-          AND m.fecha BETWEEN ? AND ?
-        WHERE ce.activo = 1
-        GROUP BY ce.codigo, ce.concepto
-        ORDER BY total DESC
-      `;
-    }
-    return this.db.prepare(sql).all(fechaInicio, fechaFin);
+    const tabla = tipo === 'ingreso' ? 'codigos_ingreso' : 'codigos_egreso';
+    const alias = tipo === 'ingreso' ? 'ci' : 'ce';
+    return this.all(`
+      SELECT ${alias}.codigo, ${alias}.concepto, COUNT(m.id) as cantidad, COALESCE(SUM(m.monto), 0) as total
+      FROM ${tabla} ${alias}
+      LEFT JOIN movimientos m ON ${alias}.codigo = m.codigo_operacion AND m.tipo = '${tipo}'
+        AND m.fecha BETWEEN '${fechaInicio}' AND '${fechaFin}'
+      WHERE ${alias}.activo = 1
+      GROUP BY ${alias}.codigo, ${alias}.concepto
+      ORDER BY total DESC
+    `);
   }
 
   getResumenPorPeriodo(fechaInicio, fechaFin, agrupacion) {
-    let dateFormat;
-    switch (agrupacion) {
-      case 'diario':
-        dateFormat = '%Y-%m-%d';
-        break;
-      case 'semanal':
-        dateFormat = '%Y-W%W';
-        break;
-      case 'mensual':
-        dateFormat = '%Y-%m';
-        break;
-      default:
-        dateFormat = '%Y-%m-%d';
-    }
-
-    return this.db.prepare(`
-      SELECT
-        strftime('${dateFormat}', fecha) as periodo,
+    const fmt = agrupacion === 'mensual' ? '%Y-%m' : agrupacion === 'semanal' ? '%Y-W%W' : '%Y-%m-%d';
+    return this.all(`
+      SELECT strftime('${fmt}', fecha) as periodo,
         SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE 0 END) as ingresos,
         SUM(CASE WHEN tipo = 'egreso' THEN monto ELSE 0 END) as egresos,
         SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE -monto END) as saldo
       FROM movimientos
-      WHERE fecha BETWEEN ? AND ?
-      GROUP BY strftime('${dateFormat}', fecha)
+      WHERE fecha BETWEEN '${fechaInicio}' AND '${fechaFin}'
+      GROUP BY strftime('${fmt}', fecha)
       ORDER BY periodo
-    `).all(fechaInicio, fechaFin);
+    `);
   }
 
   getResumenPorTercero(fechaInicio, fechaFin) {
-    return this.db.prepare(`
-      SELECT
-        t.codigo,
-        t.nombre,
-        t.tipo as tipo_tercero,
+    return this.all(`
+      SELECT t.codigo, t.nombre, t.tipo as tipo_tercero,
         SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE 0 END) as ingresos,
         SUM(CASE WHEN m.tipo = 'egreso' THEN m.monto ELSE 0 END) as egresos,
         SUM(CASE WHEN m.tipo = 'ingreso' THEN m.monto ELSE -m.monto END) as saldo
       FROM terceros t
-      LEFT JOIN movimientos m ON t.codigo = m.codigo_tercero
-        AND m.fecha BETWEEN ? AND ?
+      LEFT JOIN movimientos m ON t.codigo = m.codigo_tercero AND m.fecha BETWEEN '${fechaInicio}' AND '${fechaFin}'
       WHERE t.activo = 1
       GROUP BY t.codigo, t.nombre, t.tipo
       ORDER BY saldo DESC
-    `).all(fechaInicio, fechaFin);
+    `);
   }
 
   getComparativo(periodo1, periodo2) {
-    const datos1 = this.db.prepare(`
-      SELECT
-        SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE 0 END) as ingresos,
-        SUM(CASE WHEN tipo = 'egreso' THEN monto ELSE 0 END) as egresos,
-        SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE -monto END) as saldo
-      FROM movimientos
-      WHERE fecha BETWEEN ? AND ?
-    `).get(periodo1.inicio, periodo1.fin);
+    const d1 = this.get(`
+      SELECT COALESCE(SUM(CASE WHEN tipo='ingreso' THEN monto ELSE 0 END),0) as ingresos,
+        COALESCE(SUM(CASE WHEN tipo='egreso' THEN monto ELSE 0 END),0) as egresos,
+        COALESCE(SUM(CASE WHEN tipo='ingreso' THEN monto ELSE -monto END),0) as saldo
+      FROM movimientos WHERE fecha BETWEEN '${periodo1.inicio}' AND '${periodo1.fin}'
+    `) || { ingresos: 0, egresos: 0, saldo: 0 };
 
-    const datos2 = this.db.prepare(`
-      SELECT
-        SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE 0 END) as ingresos,
-        SUM(CASE WHEN tipo = 'egreso' THEN monto ELSE 0 END) as egresos,
-        SUM(CASE WHEN tipo = 'ingreso' THEN monto ELSE -monto END) as saldo
-      FROM movimientos
-      WHERE fecha BETWEEN ? AND ?
-    `).get(periodo2.inicio, periodo2.fin);
+    const d2 = this.get(`
+      SELECT COALESCE(SUM(CASE WHEN tipo='ingreso' THEN monto ELSE 0 END),0) as ingresos,
+        COALESCE(SUM(CASE WHEN tipo='egreso' THEN monto ELSE 0 END),0) as egresos,
+        COALESCE(SUM(CASE WHEN tipo='ingreso' THEN monto ELSE -monto END),0) as saldo
+      FROM movimientos WHERE fecha BETWEEN '${periodo2.inicio}' AND '${periodo2.fin}'
+    `) || { ingresos: 0, egresos: 0, saldo: 0 };
 
-    return {
-      periodo1: { ...periodo1, datos: datos1 },
-      periodo2: { ...periodo2, datos: datos2 }
-    };
+    return { periodo1: { ...periodo1, datos: d1 }, periodo2: { ...periodo2, datos: d2 } };
   }
 
   close() {
     if (this.db) {
+      this.save();
       this.db.close();
     }
   }
